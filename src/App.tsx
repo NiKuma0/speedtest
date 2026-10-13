@@ -1,6 +1,9 @@
 import { useRef, useState } from 'react'
 import { Gauge } from './components/Gauge'
+import { History } from './components/History'
+import { Logo } from './components/Logo'
 import { formatBytes, formatSpeed } from './lib/format'
+import { loadHistory, saveHistory, type HistoryEntry } from './lib/history'
 import { DEFAULT_SOURCE, measureDownload, measurePing } from './lib/speedtest'
 
 type Phase = 'idle' | 'ping' | 'download' | 'done'
@@ -24,7 +27,12 @@ export default function App() {
   const [progress, setProgress] = useState(0)
   const [error, setError] = useState<string | null>(null)
   const [source, setSource] = useState(() => localStorage.getItem(SOURCE_KEY) ?? DEFAULT_SOURCE)
+  const [history, setHistory] = useState<HistoryEntry[]>(loadHistory)
   const abortRef = useRef<AbortController | null>(null)
+
+  function updateHistory(update: (entries: HistoryEntry[]) => HistoryEntry[]) {
+    setHistory((h) => saveHistory(update(h)))
+  }
 
   async function start() {
     const controller = new AbortController()
@@ -58,6 +66,15 @@ export default function App() {
         },
       })
       setResults((r) => ({ ...r, download: download.mbps, bytes: download.bytes }))
+      const entry: HistoryEntry = {
+        date: Date.now(),
+        ping: ping.ping,
+        jitter: ping.jitter,
+        download: download.mbps,
+        bytes: download.bytes,
+        source,
+      }
+      updateHistory((h) => [entry, ...h])
       setPhase('done')
     } catch (e) {
       if (signal.aborted) {
@@ -84,7 +101,7 @@ export default function App() {
   return (
     <div className="app">
       <header className="header">
-        <span className="header__prompt">~/</span>speedtest
+        <Logo />
       </header>
 
       <main className="main">
@@ -139,6 +156,12 @@ export default function App() {
         </section>
 
         <SourceSettings source={source} disabled={running} onChange={changeSource} />
+
+        <History
+          entries={history}
+          onDelete={(date) => updateHistory((h) => h.filter((e) => e.date !== date))}
+          onClear={() => updateHistory(() => [])}
+        />
       </main>
     </div>
   )

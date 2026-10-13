@@ -18,6 +18,7 @@ The test downloads a file and measures how fast the bytes arrive.
   send ICMP, so this is HTTP-level latency.
 - **Download**: 4 parallel streams download the file over and over for 10 s; bytes are counted while
   reading the response stream. The first ~2 s (TCP slow start) are excluded from the final result.
+- **History**: the last 50 results are kept in `localStorage`; rows can be deleted one by one or cleared.
 - A random query parameter plus `cache: 'no-store'` keeps the browser cache out of the way.
 
 Upload isn't measured: a static site has no server to receive data.
