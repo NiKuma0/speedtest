@@ -1,25 +1,26 @@
 # Speedtest
 
-A speedtest.net-style internet speed test built with React + TypeScript + Vite.
+A minimal internet speed test (ping, jitter, download) built with React + TypeScript + Vite.
+Gruvbox dark theme. No backend and no third-party APIs.
 
 **Live:** https://nikuma0.github.io/speedtest/
 
 ## How it works
 
-GitHub Pages only serves static files, so all measurements run in the browser against
-[speed.cloudflare.com](https://speed.cloudflare.com) (CORS-enabled):
+The test downloads a file and measures how fast the bytes arrive.
 
-- **Ping / jitter** — 20 sequential `GET /__down?bytes=0` requests. RTT is measured in the browser
-  minus the server processing time reported in the `Server-Timing` header. The first request
-  (DNS/TCP/TLS handshakes) is discarded. Ping is the median, jitter is the mean difference between
-  consecutive samples. Browsers can't send ICMP, so this is an HTTP-level latency.
-- **Download** — 4 parallel streams repeatedly fetching 25 MB from `/__down` for 10 s;
-  bytes are counted while reading the response stream.
-- **Upload** — 4 parallel XHR `POST /__up` requests with 8 MB of random data for 10 s;
-  progress comes from `xhr.upload.onprogress`.
-- The final speed excludes the first ~2 s (TCP slow-start warmup).
-- **Connection info** — IP, Cloudflare data center, HTTP/TLS version from `/cdn-cgi/trace`;
-  ISP, ASN and location from [ipwho.is](https://ipwho.is).
+- **Source file**: by default `testfile.bin`, 25 MB of random (incompressible) bytes generated at build
+  time (`scripts/gen-testfile.mjs`) and served by GitHub Pages from the same origin via its CDN.
+  You can switch to any other file URL in the UI (saved in `localStorage`); the server must allow CORS.
+- **Ping / jitter**: 20 sequential `HEAD` requests (falls back to `GET` if `HEAD` is rejected),
+  timed until response headers arrive. The first request (DNS/TCP/TLS handshakes) is discarded.
+  Ping is the median, jitter is the mean difference between consecutive samples. Browsers can't
+  send ICMP, so this is HTTP-level latency.
+- **Download**: 4 parallel streams download the file over and over for 10 s; bytes are counted while
+  reading the response stream. The first ~2 s (TCP slow start) are excluded from the final result.
+- A random query parameter plus `cache: 'no-store'` keeps the browser cache out of the way.
+
+Upload isn't measured: a static site has no server to receive data.
 
 ## Development
 

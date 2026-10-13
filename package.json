@@ -4,7 +4,10 @@
   "version": "0.0.0",
   "type": "module",
   "scripts": {
+    "gen:testfile": "node scripts/gen-testfile.mjs",
+    "predev": "npm run gen:testfile",
     "dev": "vite",
+    "prebuild": "npm run gen:testfile",
     "build": "tsc -b && vite build",
     "lint": "oxlint",
     "preview": "vite preview"

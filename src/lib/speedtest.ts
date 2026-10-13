@@ -1,7 +1,8 @@
-const BASE = 'https://speed.cloudflare.com'
+/** Default source: random-bytes file generated at build time and served from the same origin. */
+export const DEFAULT_SOURCE = new URL(`${import.meta.env.BASE_URL}testfile.bin`, location.href).href
 
 export interface Progress {
-  /** Current speed in Mbps (download/upload) */
+  /** Current speed in Mbps */
   mbps: number
   /** 0..1 progress of the current phase */
   fraction: number
@@ -13,11 +14,32 @@ export interface PingResult {
   samples: number[]
 }
 
-/** Server processing time reported by Cloudflare, so it can be subtracted from RTT. */
-function serverTime(res: Response): number {
-  const header = res.headers.get('server-timing') ?? ''
-  const match = /cfSpeedWorker;dur=([\d.]+)/.exec(header) ?? /dur=([\d.]+)/.exec(header)
-  return match ? parseFloat(match[1]) : 0
+export interface DownloadResult {
+  mbps: number
+  bytes: number
+}
+
+/** Appends a random query param so the browser never serves the file from its own cache. */
+function bust(url: string): string {
+  const u = new URL(url, location.href)
+  u.searchParams.set('_r', Math.random().toString(36).slice(2))
+  return u.href
+}
+
+/** Turns the browser's opaque "Failed to fetch" into something actionable. */
+async function request(url: string, init: RequestInit): Promise<Response> {
+  let res: Response
+  try {
+    res = await fetch(bust(url), { ...init, cache: 'no-store' })
+  } catch (e) {
+    if (init.signal?.aborted) throw e
+    throw new Error(
+      `Could not load ${new URL(url, location.href).host}. The server must be reachable and allow CORS (Access-Control-Allow-Origin).`,
+      { cause: e },
+    )
+  }
+  if (!res.ok) throw new Error(`Source responded with HTTP ${res.status}`)
+  return res
 }
 
 function median(values: number[]): number {
@@ -26,27 +48,41 @@ function median(values: number[]): number {
   return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2
 }
 
+/**
+ * HTTP round-trip time: time until response headers of a HEAD request.
+ * Falls back to GET (body is discarded unread) if the server rejects HEAD.
+ */
 export async function measurePing(
+  url: string,
   count: number,
   signal: AbortSignal,
   onSample?: (ms: number, fraction: number) => void,
 ): Promise<PingResult> {
+  let method = 'HEAD'
   const samples: number[] = []
-  for (let i = 0; i < count; i++) {
+  for (let i = 0; i <= count; i++) {
     const start = performance.now()
-    const res = await fetch(`${BASE}/__down?bytes=0&r=${Math.random()}`, { signal, cache: 'no-store' })
-    await res.arrayBuffer()
-    const rtt = Math.max(performance.now() - start - serverTime(res), 0.1)
+    let res: Response
+    try {
+      res = await request(url, { method, signal })
+    } catch (e) {
+      if (method === 'GET' || signal.aborted) throw e
+      method = 'GET'
+      i--
+      continue
+    }
+    const rtt = performance.now() - start
+    res.body?.cancel()
     // The first request includes DNS + TCP + TLS handshakes, skip it
     if (i > 0) {
       samples.push(rtt)
-      onSample?.(rtt, (i + 1) / count)
+      onSample?.(rtt, i / count)
     }
   }
-  const jitterDiffs = samples.slice(1).map((v, i) => Math.abs(v - samples[i]))
+  const diffs = samples.slice(1).map((v, i) => Math.abs(v - samples[i]))
   return {
     ping: median(samples),
-    jitter: jitterDiffs.length ? jitterDiffs.reduce((a, b) => a + b, 0) / jitterDiffs.length : 0,
+    jitter: diffs.length ? diffs.reduce((a, b) => a + b, 0) / diffs.length : 0,
     samples,
   }
 }
@@ -57,7 +93,7 @@ export async function measurePing(
  */
 class Meter {
   private samples: { t: number; bytes: number }[] = []
-  private bytes = 0
+  bytes = 0
   private readonly start = performance.now()
   private readonly warmupMs: number
   private readonly windowMs: number
@@ -95,18 +131,16 @@ function toMbps(bytes: number, ms: number): number {
   return ms > 0 ? (bytes * 8) / (ms / 1000) / 1e6 : 0
 }
 
-interface TransferOptions {
+interface DownloadOptions {
+  url: string
   durationMs: number
   streams: number
   signal: AbortSignal
   onProgress: (p: Progress) => void
 }
 
-/** Runs `worker` in N parallel loops for a fixed duration, reporting the speed periodically. */
-async function runTimed(
-  { durationMs, streams, signal, onProgress }: TransferOptions,
-  worker: (meter: Meter, signal: AbortSignal) => Promise<void>,
-): Promise<number> {
+/** Downloads `url` over and over in N parallel streams for a fixed duration. */
+export async function measureDownload({ url, durationMs, streams, signal, onProgress }: DownloadOptions): Promise<DownloadResult> {
   const meter = new Meter(Math.min(2000, durationMs / 4))
   const controller = new AbortController()
   const abort = () => controller.abort()
@@ -121,9 +155,20 @@ async function runTimed(
   const loop = async () => {
     while (!controller.signal.aborted) {
       try {
-        await worker(meter, controller.signal)
+        const res = await request(url, { signal: controller.signal })
+        if (!res.body) {
+          meter.add((await res.arrayBuffer()).byteLength)
+          continue
+        }
+        const reader = res.body.getReader()
+        for (;;) {
+          const { done, value } = await reader.read()
+          if (done) break
+          meter.add(value.byteLength)
+        }
       } catch (e) {
         if (controller.signal.aborted) return
+        controller.abort()
         throw e
       }
     }
@@ -137,56 +182,5 @@ async function runTimed(
   }
   if (signal.aborted) throw new DOMException('Aborted', 'AbortError')
   meter.tick()
-  return meter.result()
-}
-
-const DOWNLOAD_CHUNK = 25 * 1024 * 1024
-
-export function measureDownload(opts: TransferOptions): Promise<number> {
-  return runTimed(opts, async (meter, signal) => {
-    const res = await fetch(`${BASE}/__down?bytes=${DOWNLOAD_CHUNK}&r=${Math.random()}`, {
-      signal,
-      cache: 'no-store',
-    })
-    if (!res.ok || !res.body) throw new Error(`Download failed: HTTP ${res.status}`)
-    const reader = res.body.getReader()
-    for (;;) {
-      const { done, value } = await reader.read()
-      if (done) break
-      meter.add(value.byteLength)
-    }
-  })
-}
-
-const UPLOAD_CHUNK = 8 * 1024 * 1024
-let uploadPayload: Blob | null = null
-
-/** Random (incompressible) payload, built once from a repeated 64 KiB random block. */
-function getUploadPayload(): Blob {
-  if (!uploadPayload) {
-    const block = crypto.getRandomValues(new Uint8Array(65536))
-    uploadPayload = new Blob(Array.from({ length: UPLOAD_CHUNK / block.length }, () => block))
-  }
-  return uploadPayload
-}
-
-export function measureUpload(opts: TransferOptions): Promise<number> {
-  const payload = getUploadPayload()
-  // fetch() can't report upload progress, so XHR is used here
-  return runTimed(opts, (meter, signal) => {
-    return new Promise<void>((resolve, reject) => {
-      const xhr = new XMLHttpRequest()
-      let sent = 0
-      xhr.upload.onprogress = (e) => {
-        meter.add(e.loaded - sent)
-        sent = e.loaded
-      }
-      xhr.onload = () => (xhr.status < 400 ? resolve() : reject(new Error(`Upload failed: HTTP ${xhr.status}`)))
-      xhr.onerror = () => reject(new Error('Upload failed: network error'))
-      xhr.onabort = () => resolve()
-      signal.addEventListener('abort', () => xhr.abort(), { once: true })
-      xhr.open('POST', `${BASE}/__up?r=${Math.random()}`)
-      xhr.send(payload)
-    })
-  })
+  return { mbps: meter.result(), bytes: meter.bytes }
 }

@@ -25,3 +25,6 @@ dist-ssr
 
 # Playwright MCP artifacts
 .playwright-mcp
+
+# Generated download test file
+public/testfile.bin

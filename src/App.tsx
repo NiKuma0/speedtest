@@ -1,22 +1,21 @@
-import { useEffect, useRef, useState } from 'react'
-import { Arrow, Gauge } from './components/Gauge'
-import { COLOS } from './lib/colos'
-import { formatSpeed } from './lib/format'
-import { fetchConnectionInfo, type ConnectionInfo } from './lib/connection'
-import { measureDownload, measurePing, measureUpload } from './lib/speedtest'
+import { useRef, useState } from 'react'
+import { Gauge } from './components/Gauge'
+import { formatBytes, formatSpeed } from './lib/format'
+import { DEFAULT_SOURCE, measureDownload, measurePing } from './lib/speedtest'
 
-type Phase = 'idle' | 'ping' | 'download' | 'upload' | 'done'
+type Phase = 'idle' | 'ping' | 'download' | 'done'
 
 interface Results {
   ping?: number
   jitter?: number
   download?: number
-  upload?: number
+  bytes?: number
 }
 
 const TEST_DURATION_MS = 10_000
 const STREAMS = 4
 const PING_COUNT = 20
+const SOURCE_KEY = 'speedtest.source'
 
 export default function App() {
   const [phase, setPhase] = useState<Phase>('idle')
@@ -24,12 +23,8 @@ export default function App() {
   const [liveSpeed, setLiveSpeed] = useState(0)
   const [progress, setProgress] = useState(0)
   const [error, setError] = useState<string | null>(null)
-  const [conn, setConn] = useState<ConnectionInfo | null>(null)
+  const [source, setSource] = useState(() => localStorage.getItem(SOURCE_KEY) ?? DEFAULT_SOURCE)
   const abortRef = useRef<AbortController | null>(null)
-
-  useEffect(() => {
-    fetchConnectionInfo().then(setConn)
-  }, [])
 
   async function start() {
     const controller = new AbortController()
@@ -38,11 +33,12 @@ export default function App() {
     setError(null)
     setResults({})
     setLiveSpeed(0)
+    setProgress(0)
 
     try {
       setPhase('ping')
       const pingSamples: number[] = []
-      const ping = await measurePing(PING_COUNT, signal, (ms, fraction) => {
+      const ping = await measurePing(source, PING_COUNT, signal, (ms, fraction) => {
         pingSamples.push(ms)
         setProgress(fraction)
         setResults({ ping: Math.min(...pingSamples) })
@@ -50,7 +46,9 @@ export default function App() {
       setResults({ ping: ping.ping, jitter: ping.jitter })
 
       setPhase('download')
+      setProgress(0)
       const download = await measureDownload({
+        url: source,
         durationMs: TEST_DURATION_MS,
         streams: STREAMS,
         signal,
@@ -59,20 +57,7 @@ export default function App() {
           setProgress(fraction)
         },
       })
-      setResults((r) => ({ ...r, download }))
-      setLiveSpeed(0)
-
-      setPhase('upload')
-      const upload = await measureUpload({
-        durationMs: TEST_DURATION_MS,
-        streams: STREAMS,
-        signal,
-        onProgress: ({ mbps, fraction }) => {
-          setLiveSpeed(mbps)
-          setProgress(fraction)
-        },
-      })
-      setResults((r) => ({ ...r, upload }))
+      setResults((r) => ({ ...r, download: download.mbps, bytes: download.bytes }))
       setPhase('done')
     } catch (e) {
       if (signal.aborted) {
@@ -88,116 +73,73 @@ export default function App() {
     }
   }
 
-  function cancel() {
-    abortRef.current?.abort()
+  function changeSource(url: string | null) {
+    if (url === null) localStorage.removeItem(SOURCE_KEY)
+    else localStorage.setItem(SOURCE_KEY, url)
+    setSource(url ?? DEFAULT_SOURCE)
   }
 
-  const running = phase === 'ping' || phase === 'download' || phase === 'upload'
-  const gaugeMode = phase === 'upload' ? 'upload' : 'download'
+  const running = phase === 'ping' || phase === 'download'
 
   return (
     <div className="app">
       <header className="header">
-        <div className="logo">
-          <svg viewBox="0 0 24 24" width="26" height="26" aria-hidden>
-            <path d="M12 3a10 10 0 0 0-8.66 15h17.32A10 10 0 0 0 12 3z" fill="none" stroke="currentColor" strokeWidth="2" />
-            <path d="M12 14l4.5-5" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
-          </svg>
-          SPEEDTEST
-        </div>
+        <span className="header__prompt">~/</span>speedtest
       </header>
 
       <main className="main">
-        <section className={`results ${phase === 'idle' ? 'results--hidden' : ''}`}>
+        <section className="results">
+          <Metric label="ping" unit="ms" value={results.ping?.toFixed(0)} active={phase === 'ping'} color="yellow" />
+          <Metric label="jitter" unit="ms" value={results.jitter?.toFixed(1)} active={phase === 'ping'} color="orange" />
           <Metric
-            label="PING"
-            unit="ms"
-            value={results.ping}
-            format={(v) => v.toFixed(0)}
-            active={phase === 'ping'}
-            extra={results.jitter !== undefined ? `jitter ${results.jitter.toFixed(1)} ms` : undefined}
-            icon={<PingIcon />}
-          />
-          <Metric
-            label="DOWNLOAD"
+            label="download"
             unit="Mbps"
-            value={phase === 'download' ? liveSpeed : results.download}
-            format={formatSpeed}
+            value={phase === 'download' ? formatSpeed(liveSpeed) : results.download !== undefined ? formatSpeed(results.download) : undefined}
             active={phase === 'download'}
-            icon={<Arrow mode="download" />}
-          />
-          <Metric
-            label="UPLOAD"
-            unit="Mbps"
-            value={phase === 'upload' ? liveSpeed : results.upload}
-            format={formatSpeed}
-            active={phase === 'upload'}
-            icon={<Arrow mode="upload" />}
+            color="aqua"
           />
         </section>
 
         <section className="stage">
           {phase === 'idle' && (
-            <button className="go" onClick={start} aria-label="Start speed test">
-              <span className="go__ring" />
-              <span className="go__label">GO</span>
+            <button className="start" onClick={start}>
+              start
             </button>
           )}
 
           {running && (
             <div className="running">
-              <Gauge mbps={liveSpeed} mode={gaugeMode} />
+              <Gauge mbps={liveSpeed} />
               <div className="progress">
-                <div className={`progress__bar progress__bar--${gaugeMode}`} style={{ width: `${progress * 100}%` }} />
+                <div className={`progress__bar progress__bar--${phase}`} style={{ width: `${progress * 100}%` }} />
               </div>
-              <div className="phase-label">
-                {phase === 'ping' ? 'Measuring latency…' : phase === 'download' ? 'Testing download…' : 'Testing upload…'}
-              </div>
-              <button className="link-button" onClick={cancel}>
-                Cancel
+              <div className="phase-label">{phase === 'ping' ? 'measuring latency…' : 'downloading…'}</div>
+              <button className="link-button" onClick={() => abortRef.current?.abort()}>
+                cancel
               </button>
             </div>
           )}
 
           {phase === 'done' && (
             <div className="done">
-              {error && <div className="error">Test failed: {error}</div>}
-              <button className="again" onClick={start}>
-                <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden>
-                  <path d="M20 12a8 8 0 1 1-2.34-5.66M20 4v5h-5" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
-                </svg>
-                TEST AGAIN
+              {error ? (
+                <div className="error">{error}</div>
+              ) : (
+                results.bytes !== undefined && (
+                  <div className="summary">
+                    downloaded {formatBytes(results.bytes)} in {TEST_DURATION_MS / 1000}s over {STREAMS} streams
+                  </div>
+                )
+              )}
+              <button className="start start--again" onClick={start}>
+                run again
               </button>
             </div>
           )}
         </section>
 
-        <section className="connection">
-          <InfoItem
-            icon={<UserIcon />}
-            title={conn?.isp ?? (conn ? 'Unknown provider' : 'Detecting…')}
-            lines={[
-              conn?.ip,
-              [conn?.city, conn?.country].filter(Boolean).join(', ') || undefined,
-              conn?.asn ? `AS${conn.asn}` : undefined,
-            ]}
-          />
-          <InfoItem
-            icon={<GlobeIcon />}
-            title="Cloudflare"
-            lines={[
-              conn?.colo ? `${COLOS[conn.colo] ?? conn.colo} (${conn.colo})` : conn ? 'Unknown location' : 'Detecting…',
-              [conn?.http?.toUpperCase(), conn?.tls].filter(Boolean).join(' · ') || undefined,
-              conn?.linkType ? `Connection: ${conn.linkType}` : undefined,
-            ]}
-          />
-        </section>
+        <SourceSettings source={source} disabled={running} onChange={changeSource} />
       </main>
-
-      <footer className="footer">
-        Measured against <a href="https://speed.cloudflare.com" target="_blank" rel="noreferrer">speed.cloudflare.com</a> · {STREAMS} parallel
-        streams · {TEST_DURATION_MS / 1000}s per test
-      </footer>
     </div>
   )
 }
@@ -205,66 +147,104 @@ export default function App() {
 interface MetricProps {
   label: string
   unit: string
-  value?: number
-  format: (v: number) => string
+  value?: string
   active: boolean
-  extra?: string
-  icon: React.ReactNode
+  color: 'yellow' | 'orange' | 'aqua'
 }
 
-function Metric({ label, unit, value, format, active, extra, icon }: MetricProps) {
+function Metric({ label, unit, value, active, color }: MetricProps) {
   return (
-    <div className={`metric ${active ? 'metric--active' : ''}`}>
-      <div className="metric__label">
-        {icon}
-        {label}
+    <div className={`metric metric--${color} ${active ? 'metric--active' : ''}`}>
+      <div className="metric__label">{label}</div>
+      <div className="metric__value">
+        {value ?? '—'}
         <span className="metric__unit">{unit}</span>
       </div>
-      <div className="metric__value">{value !== undefined ? format(value) : '—'}</div>
-      <div className="metric__extra">{extra ?? ' '}</div>
     </div>
   )
 }
 
-function InfoItem({ icon, title, lines }: { icon: React.ReactNode; title: string; lines: (string | undefined)[] }) {
+interface SourceSettingsProps {
+  source: string
+  disabled: boolean
+  onChange: (url: string | null) => void
+}
+
+function SourceSettings({ source, disabled, onChange }: SourceSettingsProps) {
+  const [editing, setEditing] = useState(false)
+  const [draft, setDraft] = useState(source)
+  const [invalid, setInvalid] = useState(false)
+  const isDefault = source === DEFAULT_SOURCE
+
+  function save(e: React.FormEvent) {
+    e.preventDefault()
+    const value = draft.trim()
+    try {
+      const url = new URL(value)
+      if (url.protocol !== 'https:' && url.protocol !== 'http:') throw new Error('bad protocol')
+    } catch {
+      setInvalid(true)
+      return
+    }
+    onChange(value === DEFAULT_SOURCE ? null : value)
+    setEditing(false)
+  }
+
+  if (editing) {
+    return (
+      <form className="source source--editing" onSubmit={save}>
+        <label className="source__label" htmlFor="source-url">
+          test file url
+        </label>
+        <input
+          id="source-url"
+          className={`source__input ${invalid ? 'source__input--invalid' : ''}`}
+          value={draft}
+          onChange={(e) => {
+            setDraft(e.target.value)
+            setInvalid(false)
+          }}
+          placeholder="https://example.com/large-image.jpg"
+          autoFocus
+          spellCheck={false}
+        />
+        <p className="source__hint">
+          Any large file (image, video, archive) works. The server must allow cross-origin requests (CORS). Bigger files give
+          more accurate results.
+        </p>
+        <div className="source__actions">
+          <button type="submit" className="btn btn--primary">
+            save
+          </button>
+          <button type="button" className="btn" onClick={() => setDraft(DEFAULT_SOURCE)}>
+            reset to default
+          </button>
+          <button type="button" className="btn" onClick={() => setEditing(false)}>
+            cancel
+          </button>
+        </div>
+      </form>
+    )
+  }
+
   return (
-    <div className="info">
-      <div className="info__icon">{icon}</div>
-      <div>
-        <div className="info__title">{title}</div>
-        {lines.filter(Boolean).map((line) => (
-          <div key={line} className="info__line">
-            {line}
-          </div>
-        ))}
-      </div>
+    <div className="source">
+      <span className="source__label">source</span>
+      <span className="source__url" title={source}>
+        {source.replace(/^https?:\/\//, '')}
+      </span>
+      {isDefault && <span className="source__badge">default</span>}
+      <button
+        className="link-button"
+        disabled={disabled}
+        onClick={() => {
+          setDraft(source)
+          setInvalid(false)
+          setEditing(true)
+        }}
+      >
+        change
+      </button>
     </div>
-  )
-}
-
-function PingIcon() {
-  return (
-    <svg className="arrow arrow--ping" viewBox="0 0 16 16" width="14" height="14" aria-hidden>
-      <circle cx="8" cy="8" r="7" fill="none" stroke="currentColor" strokeWidth="1.5" />
-      <path d="M4 8h2l1-2.5L9 11l1-3h2" fill="none" stroke="currentColor" strokeWidth="1.3" strokeLinejoin="round" />
-    </svg>
-  )
-}
-
-function UserIcon() {
-  return (
-    <svg viewBox="0 0 24 24" width="28" height="28" aria-hidden>
-      <circle cx="12" cy="8" r="4" fill="none" stroke="currentColor" strokeWidth="1.6" />
-      <path d="M4 21c0-4.4 3.6-7 8-7s8 2.6 8 7" fill="none" stroke="currentColor" strokeWidth="1.6" />
-    </svg>
-  )
-}
-
-function GlobeIcon() {
-  return (
-    <svg viewBox="0 0 24 24" width="28" height="28" aria-hidden>
-      <circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" strokeWidth="1.6" />
-      <path d="M3 12h18M12 3c2.5 2.7 3.8 5.7 3.8 9s-1.3 6.3-3.8 9c-2.5-2.7-3.8-5.7-3.8-9S9.5 5.7 12 3z" fill="none" stroke="currentColor" strokeWidth="1.6" />
-    </svg>
   )
 }
